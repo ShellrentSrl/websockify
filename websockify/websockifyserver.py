@@ -40,12 +40,9 @@ for mod, msg in [('ssl', 'TLS/SSL/wss is disabled'),
 if sys.platform == 'win32':
     # make sockets pickle-able/inheritable
     import multiprocessing.reduction
-    # the multiprocesssing module behaves much differently on Windows,
-    # and we have yet to fix all the bugs
-    sys.exit("Windows is not supported at this time")
 
 from websockify.websocket import WebSocket, WebSocketWantReadError, WebSocketWantWriteError
-from websockify.websocketserver import WebSocketRequestHandler
+from websockify.websocketserver import WebSocketRequestHandlerMixIn
 
 class CompatibleWebSocket(WebSocket):
     def select_subprotocol(self, protocols):
@@ -56,7 +53,7 @@ class CompatibleWebSocket(WebSocket):
             return ''
 
 # HTTP handler with WebSocket upgrade support
-class WebSockifyRequestHandler(WebSocketRequestHandler, SimpleHTTPRequestHandler):
+class WebSockifyRequestHandler(WebSocketRequestHandlerMixIn, SimpleHTTPRequestHandler):
     """
     WebSocket Request Handler Class, derived from SimpleHTTPRequestHandler.
     Must be sub-classed with new_websocket_client method definition.
@@ -92,15 +89,17 @@ class WebSockifyRequestHandler(WebSocketRequestHandler, SimpleHTTPRequestHandler
         self.handler_id = getattr(server, "handler_id", False)
         self.file_only = getattr(server, "file_only", False)
         self.traffic = getattr(server, "traffic", False)
+        self.web_auth = getattr(server, "web_auth", False)
+        self.host_token = getattr(server, "host_token", False)
 
         self.logger = getattr(server, "logger", None)
         if self.logger is None:
             self.logger = WebSockifyServer.get_logger()
 
-        WebSocketRequestHandler.__init__(self, req, addr, server)
+        SimpleHTTPRequestHandler.__init__(self, req, addr, server)
 
     def log_message(self, format, *args):
-        self.logger.info("%s - - [%s] %s" % (self.address_string(), self.log_date_time_string(), format % args))
+        self.logger.info("%s - - [%s] %s" % (self.client_address[0], self.log_date_time_string(), format % args))
 
     #
     # WebSocketRequestHandler logging/output functions
@@ -142,7 +141,9 @@ class WebSockifyRequestHandler(WebSocketRequestHandler, SimpleHTTPRequestHandler
         if bufs:
             for buf in bufs:
                 if self.rec:
-                    self.rec.write("%s,\n" % repr("{%s{" % tdelta + buf))
+                    # Python 3 compatible conversion
+                    bufstr = buf.decode('latin1').encode('unicode_escape').decode('ascii').replace("'", "\\'")
+                    self.rec.write("'{{{0}{{{1}',\n".format(tdelta, bufstr))
                 self.send_parts.append(buf)
 
         # Flush any previously queued data
@@ -189,7 +190,9 @@ class WebSockifyRequestHandler(WebSocketRequestHandler, SimpleHTTPRequestHandler
             self.print_traffic("}")
 
             if self.rec:
-                self.rec.write("%s,\n" % repr("}%s}" % tdelta + buf))
+                # Python 3 compatible conversion
+                bufstr = buf.decode('latin1').encode('unicode_escape').decode('ascii').replace("'", "\\'")
+                self.rec.write("'}}{0}}}{1}',\n".format(tdelta, bufstr))
 
             bufs.append(buf)
 
@@ -202,19 +205,20 @@ class WebSockifyRequestHandler(WebSocketRequestHandler, SimpleHTTPRequestHandler
         """ Send a WebSocket orderly close frame. """
         self.request.shutdown(socket.SHUT_RDWR, code, reason)
 
-    def send_pong(self, data=''):
+    def send_pong(self, data=''.encode('ascii')):
         """ Send a WebSocket pong frame. """
         self.request.pong(data)
 
-    def send_ping(self, data=''):
+    def send_ping(self, data=''.encode('ascii')):
         """ Send a WebSocket ping frame. """
         self.request.ping(data)
 
     def handle_upgrade(self):
         # ensure connection is authorized, and determine the target
         self.validate_connection()
+        self.auth_connection()
 
-        WebSocketRequestHandler.handle_upgrade(self)
+        WebSocketRequestHandlerMixIn.handle_upgrade(self)
 
     def handle_websocket(self):
         # Indicate to server that a Websocket upgrade was done
@@ -259,6 +263,10 @@ class WebSockifyRequestHandler(WebSocketRequestHandler, SimpleHTTPRequestHandler
             self.send_close(exc.args[0], exc.args[1])
 
     def do_GET(self):
+        if self.web_auth:
+            # ensure connection is authorized, this seems to apply to list_directory() as well
+            self.auth_connection()
+
         if self.only_upgrade:
             self.send_error(405, "Method Not Allowed")
         else:
@@ -275,10 +283,17 @@ class WebSockifyRequestHandler(WebSocketRequestHandler, SimpleHTTPRequestHandler
         raise Exception("WebSocketRequestHandler.new_websocket_client() must be overloaded")
 
     def validate_connection(self):
-        """ Ensure that the connection is a valid connection, and set the target. """
+        """ Ensure that the connection has a valid token, and set the target. """
+        pass
+
+    def auth_connection(self):
+        """ Ensure that the connection is authorized. """
         pass
 
     def do_HEAD(self):
+        if self.web_auth:
+            self.auth_connection()
+
         if self.only_upgrade:
             self.send_error(405, "Method Not Allowed")
         else:
@@ -288,6 +303,7 @@ class WebSockifyRequestHandler(WebSocketRequestHandler, SimpleHTTPRequestHandler
         if self.rec:
             self.rec.write("'EOF'];\n")
             self.rec.close()
+        SimpleHTTPRequestHandler.finish(self)
 
     def handle(self):
         # When using run_once, we have a single process, so
@@ -321,13 +337,13 @@ class WebSockifyServer(object):
 
     def __init__(self, RequestHandlerClass, listen_fd=None,
             listen_host='', listen_port=None, source_is_ipv6=False,
-            verbose=False, cert='', key='', ssl_only=None,
+            verbose=False, cert='', key='', key_password=None, ssl_only=None,
             verify_client=False, cafile=None,
-            daemon=False, record='', web='',
+            daemon=False, record='', web='', web_auth=False,
             file_only=False,
             run_once=False, timeout=0, idle_timeout=0, traffic=False,
             tcp_keepalive=True, tcp_keepcnt=None, tcp_keepidle=None,
-            tcp_keepintvl=None):
+            tcp_keepintvl=None, ssl_ciphers=None, ssl_options=0):
 
         # settings
         self.RequestHandlerClass = RequestHandlerClass
@@ -337,6 +353,8 @@ class WebSockifyServer(object):
         self.listen_port    = listen_port
         self.prefer_ipv6    = source_is_ipv6
         self.ssl_only       = ssl_only
+        self.ssl_ciphers    = ssl_ciphers
+        self.ssl_options    = ssl_options
         self.verify_client  = verify_client
         self.daemon         = daemon
         self.run_once       = run_once
@@ -344,6 +362,7 @@ class WebSockifyServer(object):
         self.idle_timeout   = idle_timeout
         self.traffic        = traffic
         self.file_only      = file_only
+        self.web_auth       = web_auth
 
         self.launch_time    = time.time()
         self.ws_connection  = False
@@ -358,6 +377,7 @@ class WebSockifyServer(object):
 
         # keyfile path must be None if not specified
         self.key = None
+        self.key_password = key_password
 
         # Make paths settings absolute
         self.cert = os.path.abspath(cert)
@@ -552,7 +572,10 @@ class WebSockifyServer(object):
                     and callable(ssl.create_default_context)):
                     # create new-style SSL wrapping for extended features
                     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-                    context.load_cert_chain(certfile=self.cert, keyfile=self.key)
+                    if self.ssl_ciphers is not None:
+                        context.set_ciphers(self.ssl_ciphers)
+                    context.options = self.ssl_options
+                    context.load_cert_chain(certfile=self.cert, keyfile=self.key, password=self.key_password)
                     if self.verify_client:
                         context.verify_mode = ssl.CERT_REQUIRED
                         if self.cafile:

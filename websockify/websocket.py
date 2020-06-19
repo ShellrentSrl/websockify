@@ -571,6 +571,8 @@ class WebSocket(object):
                     msg = self._partial_msg
                     self._partial_msg = ''.decode("ascii")
                     return msg
+            elif frame["opcode"] == 0x1:
+                self.shutdown(socket.SHUT_RDWR, 1003, "Unsupported: Text frames are not supported")
             elif frame["opcode"] == 0x2:
                 if self._partial_msg:
                     self.shutdown(socket.SHUT_RDWR, 1002, "Procotol error: Unexpected new frame")
@@ -597,7 +599,7 @@ class WebSocket(object):
                 code = None
                 reason = None
                 if len(frame["payload"]) >= 2:
-                    code = struct.unpack(">H", frame["payload"][:2])
+                    code = struct.unpack(">H", frame["payload"][:2])[0]
                     if len(frame["payload"]) > 2:
                         reason = frame["payload"][2:]
                         try:
@@ -607,14 +609,14 @@ class WebSocket(object):
                             continue
 
                 if code is None:
-                    self.close_code = 1005
+                    self.close_code = code = 1005
                     self.close_reason = "No close status code specified by peer"
                 else:
                     self.close_code = code
                     if reason is not None:
                         self.close_reason = reason
 
-                self.shutdown(code, reason)
+                self.shutdown(None, code, reason)
                 return None
             elif frame["opcode"] == 0x9:
                 if not frame["fin"]:
